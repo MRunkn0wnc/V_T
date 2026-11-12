@@ -1,0 +1,720 @@
+#!/usr/bin/env python3
+"""
+vt - A lightweight VirusTotal CLI (API v3). Stdlib only, no dependencies.
+
+API key resolution order (first match wins):
+  1. --api-key KEY
+  2. VT_API_KEY environment variable
+  3. Saved config file (~/.config/vt-cli/config.json) via:  vt config set-key KEY
+
+Examples:
+  vt config set-key YOUR_KEY
+  vt hash 44d88612fea8a8f36de82e1278abb02f
+  vt check ./suspicious.exe            # hashes locally, looks up, no upload
+  vt upload ./suspicious.exe --wait    # upload + wait for analysis
+  vt rescan <sha256> --wait
+  vt url https://example.com --wait
+  vt domain example.com
+  vt ip 8.8.8.8
+  vt analysis <analysis_id>
+  vt comments <hash|domain|ip>
+  vt bulk hashes.txt --csv out.csv     # one hash per line
+  vt quota
+  vt domain example.com --json         # raw JSON for any command
+
+Use only for legitimate security work. Mind VirusTotal's terms and
+public-API limits (free tier: 4 requests/min, 500/day). Files you upload
+become accessible to VT's community - never upload sensitive documents.
+"""
+
+import argparse
+import base64
+import csv
+import hashlib
+import json
+import mimetypes
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+
+BASE = "https://www.virustotal.com/api/v3"
+CONFIG_PATH = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "vt-cli" / "config.json"
+SMALL_UPLOAD_LIMIT = 32 * 1024 * 1024  # 32 MB
+MAX_UPLOAD = 650 * 1024 * 1024         # 650 MB
+
+USE_COLOR = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+
+
+def c(text, code):
+    return f"\033[{code}m{text}\033[0m" if USE_COLOR else str(text)
+
+
+red = lambda t: c(t, "31")
+green = lambda t: c(t, "32")
+yellow = lambda t: c(t, "33")
+cyan = lambda t: c(t, "36")
+bold = lambda t: c(t, "1")
+dim = lambda t: c(t, "2")
+
+
+# --------------------------------------------------------------------------
+# Config / API key
+# --------------------------------------------------------------------------
+def load_config():
+    try:
+        return json.loads(CONFIG_PATH.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_config(cfg):
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
+    try:
+        os.chmod(CONFIG_PATH, 0o600)
+    except OSError:
+        pass
+
+
+def resolve_key(cli_key):
+    key = cli_key or os.environ.get("VT_API_KEY") or load_config().get("api_key")
+    if not key:
+        die("No API key. Use --api-key, set VT_API_KEY, or run: vt config set-key <KEY>")
+    return key.strip()
+
+
+def die(msg, code=1):
+    print(red(f"[!] {msg}"), file=sys.stderr)
+    sys.exit(code)
+
+
+# --------------------------------------------------------------------------
+# HTTP client
+# --------------------------------------------------------------------------
+class VT:
+    def __init__(self, key, retries=3):
+        self.key = key
+        self.retries = retries
+
+    def _request(self, method, url, data=None, headers=None):
+        hdrs = {"x-apikey": self.key, "accept": "application/json",
+                "User-Agent": "vt-cli/1.0"}
+        hdrs.update(headers or {})
+        if not url.startswith("http"):
+            url = BASE + url
+        for attempt in range(self.retries + 1):
+            req = urllib.request.Request(url, data=data, headers=hdrs, method=method)
+            try:
+                with urllib.request.urlopen(req, timeout=60) as resp:
+                    body = resp.read()
+                    return json.loads(body) if body else {}
+            except urllib.error.HTTPError as e:
+                body = e.read().decode("utf-8", "replace")
+                try:
+                    err = json.loads(body).get("error", {})
+                except json.JSONDecodeError:
+                    err = {}
+                if e.code == 429 and attempt < self.retries:
+                    wait = 20 * (attempt + 1)
+                    print(yellow(f"[~] Rate limited. Waiting {wait}s..."), file=sys.stderr)
+                    time.sleep(wait)
+                    continue
+                if e.code == 401:
+                    die("Authentication failed: invalid API key.")
+                if e.code == 404:
+                    return {"error": {"code": "NotFoundError", "message": "Not found in VirusTotal."}}
+                die(f"HTTP {e.code}: {err.get('code', '')} {err.get('message', body[:200])}")
+            except urllib.error.URLError as e:
+                die(f"Network error: {e.reason}")
+
+    def get(self, path):
+        return self._request("GET", path)
+
+    def post_form(self, path, fields):
+        data = urllib.parse.urlencode(fields).encode()
+        return self._request("POST", path, data=data,
+                             headers={"Content-Type": "application/x-www-form-urlencoded"})
+
+    def post_file(self, url, filepath):
+        boundary = uuid.uuid4().hex
+        name = os.path.basename(filepath)
+        ctype = mimetypes.guess_type(name)[0] or "application/octet-stream"
+        with open(filepath, "rb") as f:
+            content = f.read()
+        head = (f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; "
+                f"filename=\"{name}\"\r\nContent-Type: {ctype}\r\n\r\n").encode()
+        tail = f"\r\n--{boundary}--\r\n".encode()
+        return self._request("POST", url, data=head + content + tail,
+                             headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+
+    def post(self, path):
+        return self._request("POST", path, data=b"")
+
+
+# --------------------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------------------
+def fmt_ts(ts):
+    if not ts:
+        return "n/a"
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def hash_file(path):
+    h = {"md5": hashlib.md5(), "sha1": hashlib.sha1(), "sha256": hashlib.sha256()}
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            for x in h.values():
+                x.update(chunk)
+    return {k: v.hexdigest() for k, v in h.items()}
+
+
+def url_id(url):
+    return base64.urlsafe_b64encode(url.encode()).decode().strip("=")
+
+
+def is_hash(s):
+    return bool(re.fullmatch(r"[a-fA-F0-9]{32}|[a-fA-F0-9]{40}|[a-fA-F0-9]{64}", s))
+
+
+def verdict_line(stats):
+    mal = stats.get("malicious", 0)
+    sus = stats.get("suspicious", 0)
+    total = sum(v for k, v in stats.items() if k in
+                ("malicious", "suspicious", "harmless", "undetected", "timeout"))
+    text = f"{mal + sus}/{total} flagged  (malicious: {mal}, suspicious: {sus}, " \
+           f"harmless: {stats.get('harmless', 0)}, undetected: {stats.get('undetected', 0)})"
+    if mal > 0:
+        return red(text)
+    if sus > 0:
+        return yellow(text)
+    return green(text)
+
+
+def kv(label, value):
+    print(f"  {cyan(label + ':'):<28} {value}")
+
+
+def print_detections(results, limit=25):
+    flagged = [(eng, r) for eng, r in results.items()
+               if r.get("category") in ("malicious", "suspicious")]
+    if not flagged:
+        return
+    print(bold("\n  Detections"))
+    for eng, r in sorted(flagged)[:limit]:
+        col = red if r["category"] == "malicious" else yellow
+        print(f"    {col(eng):<30} {r.get('result') or r['category']}")
+    if len(flagged) > limit:
+        print(dim(f"    ... and {len(flagged) - limit} more (use --json for all)"))
+
+
+def not_found(resp):
+    return isinstance(resp, dict) and resp.get("error", {}).get("code") == "NotFoundError"
+
+
+def emit(args, resp, printer):
+    if args.json:
+        print(json.dumps(resp, indent=2))
+    elif not_found(resp):
+        print(yellow("[?] Not found in VirusTotal (never seen). Try 'upload' / 'url' to submit."))
+    else:
+        printer(resp)
+
+
+# --------------------------------------------------------------------------
+# Printers
+# --------------------------------------------------------------------------
+def print_file(resp):
+    a = resp["data"]["attributes"]
+    print(bold(f"\n  FILE REPORT  {a.get('sha256', '')}"))
+    kv("Verdict", verdict_line(a.get("last_analysis_stats", {})))
+    kv("Name", a.get("meaningful_name") or (a.get("names") or ["n/a"])[0])
+    kv("Type", a.get("type_description", "n/a"))
+    kv("Size", f"{a.get('size', 0):,} bytes")
+    kv("MD5", a.get("md5", ""))
+    kv("SHA1", a.get("sha1", ""))
+    kv("SHA256", a.get("sha256", ""))
+    ptc = a.get("popular_threat_classification", {})
+    if ptc.get("suggested_threat_label"):
+        kv("Threat label", red(ptc["suggested_threat_label"]))
+    kv("Reputation", a.get("reputation", 0))
+    kv("First submitted", fmt_ts(a.get("first_submission_date")))
+    kv("Last analysed", fmt_ts(a.get("last_analysis_date")))
+    kv("Times submitted", a.get("times_submitted", "n/a"))
+    tags = a.get("tags")
+    if tags:
+        kv("Tags", ", ".join(tags))
+    print_detections(a.get("last_analysis_results", {}))
+    print(dim(f"\n  https://www.virustotal.com/gui/file/{a.get('sha256', '')}"))
+
+
+def print_url(resp):
+    a = resp["data"]["attributes"]
+    print(bold(f"\n  URL REPORT  {a.get('url', '')}"))
+    kv("Verdict", verdict_line(a.get("last_analysis_stats", {})))
+    kv("Final URL", a.get("last_final_url", "n/a"))
+    kv("Title", a.get("title", "n/a"))
+    kv("Reputation", a.get("reputation", 0))
+    kv("Last analysed", fmt_ts(a.get("last_analysis_date")))
+    cats = a.get("categories")
+    if cats:
+        kv("Categories", ", ".join(sorted(set(cats.values()))))
+    print_detections(a.get("last_analysis_results", {}))
+    print(dim(f"\n  https://www.virustotal.com/gui/url/{resp['data']['id']}"))
+
+
+def print_domain(resp):
+    a = resp["data"]["attributes"]
+    print(bold(f"\n  DOMAIN REPORT  {resp['data']['id']}"))
+    kv("Verdict", verdict_line(a.get("last_analysis_stats", {})))
+    kv("Registrar", a.get("registrar", "n/a"))
+    kv("Created", fmt_ts(a.get("creation_date")))
+    kv("Reputation", a.get("reputation", 0))
+    kv("TLD", a.get("tld", "n/a"))
+    cats = a.get("categories")
+    if cats:
+        kv("Categories", ", ".join(sorted(set(cats.values()))))
+    dns = a.get("last_dns_records", [])
+    if dns:
+        print(bold("\n  DNS records"))
+        for r in dns[:15]:
+            print(f"    {r.get('type', ''):<6} {r.get('value', '')}")
+    print_detections(a.get("last_analysis_results", {}))
+    print(dim(f"\n  https://www.virustotal.com/gui/domain/{resp['data']['id']}"))
+
+
+def print_ip(resp):
+    a = resp["data"]["attributes"]
+    print(bold(f"\n  IP REPORT  {resp['data']['id']}"))
+    kv("Verdict", verdict_line(a.get("last_analysis_stats", {})))
+    kv("Country", a.get("country", "n/a"))
+    kv("AS owner", a.get("as_owner", "n/a"))
+    kv("ASN", a.get("asn", "n/a"))
+    kv("Network", a.get("network", "n/a"))
+    kv("Reputation", a.get("reputation", 0))
+    print_detections(a.get("last_analysis_results", {}))
+    print(dim(f"\n  https://www.virustotal.com/gui/ip-address/{resp['data']['id']}"))
+
+
+def print_analysis(resp):
+    a = resp["data"]["attributes"]
+    status = a.get("status")
+    print(bold(f"\n  ANALYSIS  {resp['data']['id']}"))
+    kv("Status", green(status) if status == "completed" else yellow(status))
+    kv("Verdict", verdict_line(a.get("stats", {})))
+    kv("Date", fmt_ts(a.get("date")))
+    print_detections(a.get("results", {}))
+    sha = resp.get("meta", {}).get("file_info", {}).get("sha256")
+    if sha:
+        print(dim(f"\n  https://www.virustotal.com/gui/file/{sha}"))
+
+
+def print_comments(resp):
+    items = resp.get("data", [])
+    if not items:
+        print("  No comments.")
+        return
+    for it in items:
+        a = it["attributes"]
+        print(f"\n  {cyan(fmt_ts(a.get('date')))}  votes: +{a.get('votes', {}).get('positive', 0)}"
+              f"/-{a.get('votes', {}).get('negative', 0)}")
+        print("  " + a.get("text", "").replace("\n", "\n  "))
+
+
+# --------------------------------------------------------------------------
+# Analysis polling
+# --------------------------------------------------------------------------
+def wait_for_analysis(vt, analysis_id, timeout=600, interval=15):
+    start = time.time()
+    while True:
+        resp = vt.get(f"/analyses/{analysis_id}")
+        status = resp.get("data", {}).get("attributes", {}).get("status")
+        if status == "completed":
+            return resp
+        if time.time() - start > timeout:
+            die(f"Timed out waiting for analysis {analysis_id}")
+        print(dim(f"  ... status: {status}, checking again in {interval}s"), file=sys.stderr)
+        time.sleep(interval)
+
+
+def finish_submission(args, vt, resp, kind):
+    aid = resp.get("data", {}).get("id")
+    if not aid:
+        die("Submission failed: no analysis ID returned.")
+    if not args.wait:
+        if args.json:
+            print(json.dumps(resp, indent=2))
+        else:
+            print(green(f"[+] {kind} submitted. Analysis ID:"))
+            print(f"    {aid}")
+            print(dim(f"    Check later: vt analysis {aid}"))
+        return
+    print(dim("[*] Waiting for analysis to complete..."), file=sys.stderr)
+    final = wait_for_analysis(vt, aid, timeout=args.timeout)
+    emit(args, final, print_analysis)
+
+
+# --------------------------------------------------------------------------
+# Commands
+# --------------------------------------------------------------------------
+def cmd_config(args):
+    cfg = load_config()
+    if args.action == "set-key":
+        cfg["api_key"] = args.value.strip()
+        save_config(cfg)
+        print(green(f"[+] API key saved to {CONFIG_PATH}"))
+    elif args.action == "show":
+        k = cfg.get("api_key")
+        print(f"Config file: {CONFIG_PATH}")
+        print("Saved key:  ", (k[:4] + "..." + k[-4:]) if k else "(none)")
+        print("VT_API_KEY: ", "set" if os.environ.get("VT_API_KEY") else "(not set)")
+    elif args.action == "clear":
+        cfg.pop("api_key", None)
+        save_config(cfg)
+        print(green("[+] Saved API key removed."))
+
+
+def cmd_hash(args, vt):
+    if not is_hash(args.hash):
+        die("Not a valid MD5/SHA1/SHA256 hash.")
+    emit(args, vt.get(f"/files/{args.hash}"), print_file)
+
+
+def cmd_check(args, vt):
+    p = Path(args.file)
+    if not p.is_file():
+        die(f"No such file: {p}")
+    hashes = hash_file(p)
+    if not args.json:
+        print(dim(f"[*] SHA256: {hashes['sha256']}  (file not uploaded)"))
+    emit(args, vt.get(f"/files/{hashes['sha256']}"), print_file)
+
+
+def cmd_upload(args, vt):
+    p = Path(args.file)
+    if not p.is_file():
+        die(f"No such file: {p}")
+    size = p.stat().st_size
+    if size > MAX_UPLOAD:
+        die("File exceeds the 650 MB VirusTotal limit.")
+    if not args.yes:
+        ans = input(yellow(f"Upload '{p.name}' to VirusTotal? It becomes visible to the community. [y/N] "))
+        if ans.lower() != "y":
+            die("Aborted.", 0)
+    if size > SMALL_UPLOAD_LIMIT:
+        upload_url = vt.get("/files/upload_url")["data"]
+        resp = vt.post_file(upload_url, str(p))
+    else:
+        resp = vt.post_file("/files", str(p))
+    finish_submission(args, vt, resp, "File")
+
+
+def cmd_rescan(args, vt):
+    if not is_hash(args.hash):
+        die("Not a valid hash.")
+    resp = vt.post(f"/files/{args.hash}/analyse")
+    finish_submission(args, vt, resp, "Rescan")
+
+
+def cmd_url(args, vt):
+    if args.submit:
+        resp = vt.post_form("/urls", {"url": args.url})
+        finish_submission(args, vt, resp, "URL")
+        return
+    resp = vt.get(f"/urls/{url_id(args.url)}")
+    if not_found(resp) and not args.json:
+        print(yellow("[?] URL not yet known to VT - submitting for analysis..."))
+        resp = vt.post_form("/urls", {"url": args.url})
+        finish_submission(args, vt, resp, "URL")
+        return
+    emit(args, resp, print_url)
+
+
+def cmd_domain(args, vt):
+    emit(args, vt.get(f"/domains/{args.domain}"), print_domain)
+
+
+def cmd_ip(args, vt):
+    emit(args, vt.get(f"/ip_addresses/{args.ip}"), print_ip)
+
+
+def cmd_analysis(args, vt):
+    emit(args, vt.get(f"/analyses/{args.id}"), print_analysis)
+
+
+def cmd_comments(args, vt):
+    t = args.target
+    if is_hash(t):
+        path = f"/files/{t}/comments"
+    elif re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", t) or ":" in t:
+        path = f"/ip_addresses/{t}/comments"
+    elif t.startswith("http"):
+        path = f"/urls/{url_id(t)}/comments"
+    else:
+        path = f"/domains/{t}/comments"
+    emit(args, vt.get(path + f"?limit={args.limit}"), print_comments)
+
+
+def cmd_bulk(args, vt):
+    lines = [l.strip() for l in Path(args.file).read_text().splitlines()
+             if l.strip() and not l.startswith("#")]
+    rows = []
+    for i, h in enumerate(lines, 1):
+        if not is_hash(h):
+            print(yellow(f"[!] Skipping invalid hash: {h}"), file=sys.stderr)
+            continue
+        resp = vt.get(f"/files/{h}")
+        if not_found(resp):
+            rows.append({"hash": h, "status": "not_found"})
+            print(f"  [{i}/{len(lines)}] {h}  {yellow('not found')}")
+        else:
+            a = resp["data"]["attributes"]
+            s = a.get("last_analysis_stats", {})
+            rows.append({
+                "hash": h, "status": "found",
+                "malicious": s.get("malicious", 0), "suspicious": s.get("suspicious", 0),
+                "harmless": s.get("harmless", 0), "undetected": s.get("undetected", 0),
+                "name": a.get("meaningful_name", ""), "type": a.get("type_description", ""),
+                "label": a.get("popular_threat_classification", {}).get("suggested_threat_label", ""),
+                "sha256": a.get("sha256", ""),
+            })
+            col = red if s.get("malicious", 0) else green
+            print(f"  [{i}/{len(lines)}] {h}  {col(str(s.get('malicious', 0)) + ' malicious')}")
+        if i < len(lines) and args.delay:
+            time.sleep(args.delay)
+    if args.csv:
+        fields = ["hash", "status", "malicious", "suspicious", "harmless",
+                  "undetected", "name", "type", "label", "sha256"]
+        with open(args.csv, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=fields)
+            w.writeheader()
+            w.writerows(rows)
+        print(green(f"[+] Results written to {args.csv}"))
+    if args.json:
+        print(json.dumps(rows, indent=2))
+
+
+def cmd_quota(args, vt):
+    resp = vt.get(f"/users/{vt.key}")
+    if args.json:
+        print(json.dumps(resp, indent=2))
+        return
+    a = resp["data"]["attributes"]
+    print(bold(f"\n  ACCOUNT  {a.get('user', resp['data']['id'])}"))
+    for name, q in a.get("quotas", {}).items():
+        allowed = q.get("user", {}).get("allowed") or q.get("allowed")
+        used = q.get("user", {}).get("used") or q.get("used")
+        if allowed is not None:
+            kv(name.replace("_", " "), f"{used}/{allowed}")
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+MAIN_EPILOG = """\
+==============================================================================
+ STEP 1 - GET AN API KEY
+==============================================================================
+  1. Sign up / log in at https://www.virustotal.com
+  2. Click your profile icon (top right) -> "API Key" and copy the key.
+  (Free keys: 4 requests/minute, 500/day. Premium keys have higher limits.)
+
+==============================================================================
+ STEP 2 - ADD THE API KEY  (pick ONE method; first match wins in this order)
+==============================================================================
+  A) Per command (highest priority, nothing is saved):
+       vt hash <HASH> --api-key YOUR_KEY
+       vt hash <HASH> -k YOUR_KEY
+
+  B) Environment variable (good for a session or CI):
+       Linux/macOS :  export VT_API_KEY=YOUR_KEY
+       Windows CMD :  set VT_API_KEY=YOUR_KEY
+       PowerShell  :  $env:VT_API_KEY = "YOUR_KEY"
+
+  C) Save it once in the config file (~/.config/vt-cli/config.json, chmod 600):
+       vt config set-key YOUR_KEY     # save / replace the key
+       vt config show                 # show saved key (masked)
+       vt config clear                # delete the saved key
+
+  To REPLACE the key later: run "config set-key NEWKEY" again, change the
+  VT_API_KEY variable, or just pass -k NEWKEY.
+
+==============================================================================
+ STEP 3 - COMMANDS (replace the <placeholders>)
+==============================================================================
+  Files
+    vt hash 44d88612fea8a8f36de82e1278abb02f   # lookup by MD5/SHA1/SHA256
+    vt check ./suspicious.exe                  # hash locally + lookup (NO upload)
+    vt upload ./suspicious.exe                 # upload for scanning (asks to confirm)
+    vt upload ./suspicious.exe --wait -y       # upload, skip prompt, wait for result
+    vt rescan <sha256> --wait                  # re-analyse a file VT already has
+
+  URLs / domains / IPs
+    vt url https://example.com                 # report (auto-submits if unknown)
+    vt url https://example.com --submit --wait # force a fresh scan and wait
+    vt domain example.com
+    vt ip 8.8.8.8
+
+  Analyses, comments, bulk, account
+    vt analysis <analysis_id>                  # ID is printed by upload/url/rescan
+    vt comments <hash|domain|ip|url> --limit 20
+    vt bulk hashes.txt --csv results.csv       # one hash per line, '#' = comment
+    vt bulk hashes.txt --delay 0               # no pause (premium keys only)
+    vt quota                                   # API usage / limits
+
+  Global options (available on every query command)
+    -k, --api-key KEY    use this key for this run only
+    --json               print raw JSON instead of the formatted report
+
+  Per-command help with more examples:   vt <command> --help
+
+==============================================================================
+ NOTES
+==============================================================================
+  * "check" and "hash" only send a hash - the file never leaves your machine.
+  * "upload" makes the file visible to the VirusTotal community. Never upload
+    confidential documents.
+  * Exit on bad key: "Authentication failed: invalid API key."
+  * Colors are disabled automatically when piping; set NO_COLOR=1 to force off.
+"""
+
+COMMAND_HELP = {
+    "config": "Save, show or clear the API key stored in ~/.config/vt-cli/config.json.\n\n"
+              "Examples:\n  vt config set-key YOUR_KEY\n"
+              "  vt config show\n  vt config clear\n",
+    "hash": "Look up an existing file report by MD5, SHA1 or SHA256 hash.\n\n"
+            "Examples:\n  vt hash 44d88612fea8a8f36de82e1278abb02f\n"
+            "  vt hash <sha256> --json\n  vt hash <sha256> -k YOUR_KEY\n",
+    "check": "Hash a LOCAL file (MD5/SHA1/SHA256) and look it up - the file is NOT uploaded.\n\n"
+             "Examples:\n  vt check ./sample.exe\n  vt check ./sample.exe --json\n",
+    "upload": "Upload a file to VirusTotal for scanning (max 650 MB; files >32 MB handled automatically).\n\n"
+              "Examples:\n  vt upload ./sample.exe\n"
+              "  vt upload ./sample.exe --wait          # poll until the scan finishes\n"
+              "  vt upload ./sample.exe --wait -y       # skip the confirmation prompt\n"
+              "  vt upload ./sample.exe --wait --timeout 900\n\n"
+              "Warning: uploaded files become visible to the VirusTotal community.\n",
+    "rescan": "Ask VirusTotal to re-analyse a file it already knows.\n\n"
+              "Examples:\n  vt rescan <sha256>\n  vt rescan <sha256> --wait\n",
+    "url": "Get a URL report; unknown URLs are submitted automatically.\n\n"
+           "Examples:\n  vt url https://example.com\n"
+           "  vt url https://example.com --submit --wait   # force new scan\n"
+           "  vt url \"https://example.com/path?a=1\" --json\n",
+    "domain": "Get a domain report (verdict, registrar, DNS records, detections).\n\n"
+              "Examples:\n  vt domain example.com\n  vt domain example.com --json\n",
+    "ip": "Get an IP address report (verdict, country, AS owner, detections).\n\n"
+          "Examples:\n  vt ip 8.8.8.8\n  vt ip 2001:4860:4860::8888\n",
+    "analysis": "Fetch the status/result of an analysis by its ID (printed by upload/url/rescan).\n\n"
+                "Examples:\n  vt analysis <analysis_id>\n",
+    "comments": "Show community comments for a hash, domain, IP or URL.\n\n"
+                "Examples:\n  vt comments <sha256>\n  vt comments example.com --limit 20\n"
+                "  vt comments 8.8.8.8\n",
+    "bulk": "Look up many hashes from a text file (one per line, '#' lines ignored).\n\n"
+            "Examples:\n  vt bulk hashes.txt\n"
+            "  vt bulk hashes.txt --csv results.csv\n"
+            "  vt bulk hashes.txt --delay 0       # premium keys only\n\n"
+            "Default delay is 15s per request to respect the free tier (4 req/min).\n",
+    "quota": "Show API quota usage for the current key.\n\n"
+             "Examples:\n  vt quota\n  vt quota -k YOUR_KEY\n",
+}
+
+def build_parser():
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("-k", "--api-key", help="VirusTotal API key (overrides env/config)")
+    common.add_argument("--json", action="store_true", help="Output raw JSON")
+
+    p = argparse.ArgumentParser(
+        prog="vt",
+        description="VirusTotal CLI (API v3) - look up files, URLs, domains and IPs, "
+                    "and submit files/URLs for scanning.",
+        epilog=MAIN_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sub = p.add_subparsers(dest="command", required=True, metavar="COMMAND")
+
+    s = sub.add_parser("config", help="Manage the saved API key")
+    s.add_argument("action", choices=["set-key", "show", "clear"])
+    s.add_argument("value", nargs="?", help="API key (for set-key)")
+
+    s = sub.add_parser("hash", parents=[common], help="Look up a file by MD5/SHA1/SHA256")
+    s.add_argument("hash")
+
+    s = sub.add_parser("check", parents=[common], help="Hash a local file and look it up (no upload)")
+    s.add_argument("file")
+
+    s = sub.add_parser("upload", parents=[common], help="Upload a file for scanning")
+    s.add_argument("file")
+    s.add_argument("--wait", action="store_true", help="Wait for analysis to finish")
+    s.add_argument("--timeout", type=int, default=600)
+    s.add_argument("-y", "--yes", action="store_true", help="Skip upload confirmation")
+
+    s = sub.add_parser("rescan", parents=[common], help="Request re-analysis of a known file")
+    s.add_argument("hash")
+    s.add_argument("--wait", action="store_true")
+    s.add_argument("--timeout", type=int, default=600)
+
+    s = sub.add_parser("url", parents=[common], help="Report on a URL (submits if unknown)")
+    s.add_argument("url")
+    s.add_argument("--submit", action="store_true", help="Force a fresh scan")
+    s.add_argument("--wait", action="store_true")
+    s.add_argument("--timeout", type=int, default=600)
+
+    s = sub.add_parser("domain", parents=[common], help="Domain report")
+    s.add_argument("domain")
+
+    s = sub.add_parser("ip", parents=[common], help="IP address report")
+    s.add_argument("ip")
+
+    s = sub.add_parser("analysis", parents=[common], help="Fetch an analysis by ID")
+    s.add_argument("id")
+
+    s = sub.add_parser("comments", parents=[common], help="Community comments for a hash/domain/IP/URL")
+    s.add_argument("target")
+    s.add_argument("--limit", type=int, default=10)
+
+    s = sub.add_parser("bulk", parents=[common], help="Look up many hashes from a file")
+    s.add_argument("file", help="Text file, one hash per line")
+    s.add_argument("--csv", help="Write results to CSV")
+    s.add_argument("--delay", type=float, default=15.0,
+                   help="Seconds between requests (default 15 = free-tier friendly; 0 to disable)")
+
+    sub.add_parser("quota", parents=[common], help="Show API quota usage")
+
+    # Detailed per-command help ("vt <command> --help")
+    for name, text in COMMAND_HELP.items():
+        sp = sub.choices[name]
+        sp.description = text.split("\n\n")[0]
+        sp.epilog = text
+        sp.formatter_class = argparse.RawDescriptionHelpFormatter
+    return p
+
+
+def main():
+    args = build_parser().parse_args()
+    if args.command == "config":
+        if args.action == "set-key" and not args.value:
+            die("Usage: vt config set-key <API_KEY>")
+        return cmd_config(args)
+    vt = VT(resolve_key(args.api_key))
+    handlers = {
+        "hash": cmd_hash, "check": cmd_check, "upload": cmd_upload,
+        "rescan": cmd_rescan, "url": cmd_url, "domain": cmd_domain,
+        "ip": cmd_ip, "analysis": cmd_analysis, "comments": cmd_comments,
+        "bulk": cmd_bulk, "quota": cmd_quota,
+    }
+    try:
+        handlers[args.command](args, vt)
+    except KeyboardInterrupt:
+        die("Interrupted.", 130)
+    except BrokenPipeError:
+        pass
+
+
+if __name__ == "__main__":
+    main()
